@@ -129,14 +129,15 @@ def train(config, workdir):
   reduce_mean = config.training.reduce_mean
   likelihood_weighting = config.training.likelihood_weighting
   mixed_precision = getattr(config.training, 'mixed_precision', False)
+  amp_dtype = getattr(torch, getattr(config.training, 'amp_dtype', 'bfloat16'))
   train_step_fn = losses.get_step_fn(sde, train=True, optimize_fn=optimize_fn,
                                      reduce_mean=reduce_mean, continuous=continuous,
                                      likelihood_weighting=likelihood_weighting,
-                                     mixed_precision=mixed_precision)
+                                     mixed_precision=mixed_precision, amp_dtype=amp_dtype)
   eval_step_fn = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
                                     reduce_mean=reduce_mean, continuous=continuous,
                                     likelihood_weighting=likelihood_weighting,
-                                    mixed_precision=mixed_precision)
+                                    mixed_precision=mixed_precision, amp_dtype=amp_dtype)
 
   # Building sampling functions
   if config.training.snapshot_sampling:
@@ -149,14 +150,20 @@ def train(config, workdir):
   # In case there are multiple hosts (e.g., TPU pods), only log to host 0
   logging.info("Starting training loop at step %d." % (initial_step,))
 
+  last_log_time = time.time()
+  last_log_step = initial_step
   for step in range(initial_step, num_train_steps + 1):
     batch = next(train_iter)['image'].to(config.device, non_blocking=True).float()
     batch = scaler(batch)
     # Execute one training step
     loss = train_step_fn(state, batch)
     if is_main_process and step % config.training.log_freq == 0:
-      logging.info("step: %d, training_loss: %.5e" % (step, loss.item()))
+      current_time = time.time()
+      steps_per_sec = (step - last_log_step) / (current_time - last_log_time) if step > last_log_step else 0.0
+      last_log_time, last_log_step = current_time, step
+      logging.info("step: %d, training_loss: %.5e, step/sec: %.3f" % (step, loss.item(), steps_per_sec))
       writer.add_scalar("training_loss", loss, step)
+      writer.add_scalar("step_per_sec", steps_per_sec, step)
 
     # Save a temporary checkpoint to resume training after pre-emption periodically
     if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
@@ -165,13 +172,18 @@ def train(config, workdir):
       if distributed:
         dist.barrier()
 
-    # Report the loss on an evaluation dataset periodically
-    if is_main_process and step % config.training.eval_freq == 0:
+    # Report the loss on an evaluation dataset periodically.
+    # Every rank must run this forward pass (even though only rank 0 logs it):
+    # `state['model']` is DDP-wrapped, and calling its forward on rank 0 only
+    # desyncs DDP's internal bookkeeping from the other ranks, deadlocking the
+    # next training step's gradient all-reduce.
+    if step % config.training.eval_freq == 0:
       eval_batch = next(eval_iter)['image'].to(config.device, non_blocking=True).float()
       eval_batch = scaler(eval_batch)
       eval_loss = eval_step_fn(state, eval_batch)
-      logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
-      writer.add_scalar("eval_loss", eval_loss.item(), step)
+      if is_main_process:
+        logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
+        writer.add_scalar("eval_loss", eval_loss.item(), step)
 
     # Save a checkpoint periodically and generate samples if needed
     if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps:

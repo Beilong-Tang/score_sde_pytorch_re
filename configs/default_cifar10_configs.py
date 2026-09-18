@@ -6,7 +6,7 @@ def get_default_configs():
   config = ml_collections.ConfigDict()
   # training
   config.training = training = ml_collections.ConfigDict()
-  config.training.batch_size = 128
+  config.training.batch_size = 32 # batch_size per rank
   training.n_iters = 1300001
   training.snapshot_freq = 50000
   training.log_freq = 50
@@ -21,6 +21,9 @@ def get_default_configs():
   ## per-GPU batch size under `torchrun` multi-GPU training; effective global
   ## batch size is `batch_size * nproc_per_node`.
   training.mixed_precision = True
+  ## dtype used for `torch.autocast` when `mixed_precision` is enabled.
+  ## Use 'float16' on GPUs that don't support bfloat16 (e.g. pre-Ampere).
+  training.amp_dtype = 'bfloat16'
   training.compile = False
 
   # sampling

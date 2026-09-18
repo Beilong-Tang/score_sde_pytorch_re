@@ -23,8 +23,11 @@ import torch
 import torch.distributed as dist
 import torchvision
 import torchvision.transforms.functional as TF
+from absl import flags
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+
+FLAGS = flags.FLAGS
 
 
 def get_data_scaler(config):
@@ -101,14 +104,9 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
   Returns:
     train_ds, eval_ds, dataset_builder.
   """
-  if config.data.dataset != 'CIFAR10':
-    raise NotImplementedError(
-      f'Dataset {config.data.dataset} not supported. This PyTorch-only '
-      'data pipeline currently supports CIFAR10 only.')
-
   batch_size = config.training.batch_size if not evaluation else config.eval.batch_size
   num_workers = getattr(config.data, 'num_workers', 4)
-  data_root = getattr(config.data, 'root', './data')
+  data_root = FLAGS.datadir
   num_epochs = None if not evaluation else 1
 
   distributed = dist.is_available() and dist.is_initialized()

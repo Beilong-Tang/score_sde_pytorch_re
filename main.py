@@ -30,6 +30,7 @@ flags.DEFINE_string("workdir", None, "Work directory.")
 flags.DEFINE_enum("mode", None, ["train", "eval"], "Running mode: train or eval")
 flags.DEFINE_string("eval_folder", "eval",
                     "The folder name for storing evaluation results")
+flags.DEFINE_string("datadir", "./data", "The root directory for the dataset.")
 flags.mark_flags_as_required(["workdir", "config", "mode"])
 
 

@@ -149,7 +149,7 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
 
 
 def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
-                mixed_precision=False):
+                mixed_precision=False, amp_dtype=torch.bfloat16):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -159,8 +159,10 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     continuous: `True` indicates that the model is defined to take continuous time steps.
     likelihood_weighting: If `True`, weight the mixture of score matching losses according to
       https://arxiv.org/abs/2101.09258; otherwise use the weighting recommended by our paper.
-    mixed_precision: If `True`, run the forward pass and loss computation under bfloat16 autocast.
+    mixed_precision: If `True`, run the forward pass and loss computation under `amp_dtype` autocast.
       Gradients/optimizer state and EMA remain in fp32, so no loss scaler is needed.
+    amp_dtype: The `torch.dtype` used for autocast when `mixed_precision` is `True`
+      (`torch.bfloat16` or `torch.float16`; not all GPUs support bfloat16).
 
   Returns:
     A one-step function for training or evaluation.
@@ -195,7 +197,7 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     if train:
       optimizer = state['optimizer']
       optimizer.zero_grad()
-      with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=mixed_precision):
+      with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=mixed_precision):
         loss = loss_fn(model, batch)
       loss.backward()
       optimize_fn(optimizer, model.parameters(), step=state['step'])
@@ -206,7 +208,7 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
         ema = state['ema']
         ema.store(model.parameters())
         ema.copy_to(model.parameters())
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=mixed_precision):
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=mixed_precision):
           loss = loss_fn(model, batch)
         ema.restore(model.parameters())
 

@@ -11,23 +11,29 @@ set -euo pipefail
 
 CONFIG="configs/vp/cifar10_ddpmpp_continuous.py"
 WORKDIR="workdir/cifar10_ddpmpp_continuous"
+DATADIR="/home/btang5/work/2025/pytorch-ddpm/data"
 NPROC_PER_NODE=4
 NUM_SAMPLES=50000
-EVAL_BATCH_SIZE=1024
+EVAL_BATCH_SIZE=32 # batch_size per rank
+AMP_DTYPE=float16
+BATCH_SIZE_PER_RANK=32
 
 cd "$(dirname "$0")"
-
-# FID/KID need reference Inception activations for the training set.
-if [ ! -f "assets/stats/cifar10_stats.npz" ]; then
-  echo "==> Precomputing CIFAR-10 Inception stats..."
-  python compute_dataset_stats.py
-fi
 
 echo "==> Training on ${NPROC_PER_NODE} GPUs..."
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" main.py \
   --config="${CONFIG}" \
   --mode=train \
-  --workdir="${WORKDIR}"
+  --workdir="${WORKDIR}" \
+  --datadir="${DATADIR}" \
+  --config.training.amp_dtype=$AMP_DTYPE \
+  --config.training.batch_size=$BATCH_SIZE_PER_RANK
+
+  # FID/KID need reference Inception activations for the training set.
+if [ ! -f "assets/stats/cifar10_stats.npz" ]; then
+  echo "==> Precomputing CIFAR-10 Inception stats..."
+  python compute_dataset_stats.py
+fi
 
 # Evaluation (run_lib.evaluate) is single-process only, so no torchrun here.
 # Pick the checkpoint with the highest index written by training.
@@ -42,6 +48,7 @@ python main.py \
   --config="${CONFIG}" \
   --mode=eval \
   --workdir="${WORKDIR}" \
+  --datadir="${DATADIR}" \
   --eval_folder="eval_${NUM_SAMPLES}" \
   --config.eval.enable_sampling=True \
   --config.eval.enable_loss=False \
