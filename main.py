@@ -21,7 +21,6 @@ from absl import flags
 from ml_collections.config_flags import config_flags
 import logging
 import os
-import tensorflow as tf
 
 FLAGS = flags.FLAGS
 
@@ -35,18 +34,23 @@ flags.mark_flags_as_required(["workdir", "config", "mode"])
 
 
 def main(argv):
+  # Under `torchrun` multiple processes run this same script; only rank 0
+  # should own the shared log file to avoid multiple writers clobbering it.
+  rank = int(os.environ.get('RANK', 0))
   if FLAGS.mode == "train":
     # Create the working directory
-    tf.io.gfile.makedirs(FLAGS.workdir)
-    # Set logger so that it outputs to both console and file
-    # Make logging work for both disk and Google Cloud Storage
-    gfile_stream = open(os.path.join(FLAGS.workdir, 'stdout.txt'), 'w')
-    handler = logging.StreamHandler(gfile_stream)
-    formatter = logging.Formatter('%(levelname)s - %(filename)s - %(asctime)s - %(message)s')
-    handler.setFormatter(formatter)
+    os.makedirs(FLAGS.workdir, exist_ok=True)
     logger = logging.getLogger()
-    logger.addHandler(handler)
-    logger.setLevel('INFO')
+    if rank == 0:
+      # Set logger so that it outputs to both console and file
+      gfile_stream = open(os.path.join(FLAGS.workdir, 'stdout.txt'), 'w')
+      handler = logging.StreamHandler(gfile_stream)
+      formatter = logging.Formatter('%(levelname)s - %(filename)s - %(asctime)s - %(message)s')
+      handler.setFormatter(formatter)
+      logger.addHandler(handler)
+      logger.setLevel('INFO')
+    else:
+      logger.setLevel('WARNING')
     # Run the training pipeline
     run_lib.train(FLAGS.config, FLAGS.workdir)
   elif FLAGS.mode == "eval":

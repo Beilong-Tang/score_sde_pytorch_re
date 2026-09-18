@@ -18,6 +18,10 @@ def get_default_configs():
   training.likelihood_weighting = False
   training.continuous = True
   training.reduce_mean = False
+  ## per-GPU batch size under `torchrun` multi-GPU training; effective global
+  ## batch size is `batch_size * nproc_per_node`.
+  training.mixed_precision = True
+  training.compile = False
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
@@ -45,6 +49,7 @@ def get_default_configs():
   data.centered = False
   data.uniform_dequantization = False
   data.num_channels = 3
+  data.num_workers = 8
 
   # model
   config.model = model = ml_collections.ConfigDict()

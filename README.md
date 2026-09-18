@@ -77,9 +77,17 @@ Run the following to install a subset of necessary python packages for our code
 pip install -r requirements.txt
 ```
 
+> **Note:** This fork removes the TensorFlow/TFDS/TF-GAN dependencies from the original codebase in favor of a pure PyTorch data pipeline and a PyTorch Inception-v3 network for FID/IS/KID evaluation. As a result, only the `CIFAR10` dataset is currently supported.
+
 ### Stats files for quantitative evaluation
 
-We provide the stats file for CIFAR-10. You can download [`cifar10_stats.npz`](https://drive.google.com/file/d/14UB27-Spi8VjZYKST3ZcT8YVhAluiFWI/view?usp=sharing)  and save it to `assets/stats/`. Check out [#5](https://github.com/yang-song/score_sde/pull/5) on how to compute this stats file for new datasets.
+Since evaluation now uses a PyTorch Inception-v3 network instead of the original TF-Hub one, reference activations must be recomputed rather than downloaded. Run:
+
+```sh
+python compute_dataset_stats.py
+```
+
+This downloads CIFAR-10 (if needed) and writes `assets/stats/cifar10_stats.npz`.
 
 ### Usage
 
@@ -98,7 +106,7 @@ main.py:
 * `config` is the path to the config file. Our prescribed config files are provided in `configs/`. They are formatted according to [`ml_collections`](https://github.com/google/ml_collections) and should be quite self-explanatory.
 
   **Naming conventions of config files**: the path of a config file is a combination of the following dimensions:
-  *  dataset: One of `cifar10`, `celeba`, `celebahq`, `celebahq_256`, `ffhq_256`, `celebahq`, `ffhq`.
+  *  dataset: One of `cifar10`, `celeba`, `celebahq`, `celebahq_256`, `ffhq_256`, `celebahq`, `ffhq`. Since TensorFlow/TFDS was removed in favor of a pure PyTorch data pipeline, only `cifar10` configs are currently runnable; the others are kept for reference.
   * model: One of `ncsn`, `ncsnv2`, `ncsnpp`, `ddpm`, `ddpmpp`.
   * continuous: train the model with continuously sampled time steps. 
 

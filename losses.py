@@ -148,7 +148,8 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
   return loss_fn
 
 
-def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
+def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
+                mixed_precision=False):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -158,6 +159,8 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     continuous: `True` indicates that the model is defined to take continuous time steps.
     likelihood_weighting: If `True`, weight the mixture of score matching losses according to
       https://arxiv.org/abs/2101.09258; otherwise use the weighting recommended by our paper.
+    mixed_precision: If `True`, run the forward pass and loss computation under bfloat16 autocast.
+      Gradients/optimizer state and EMA remain in fp32, so no loss scaler is needed.
 
   Returns:
     A one-step function for training or evaluation.
@@ -192,7 +195,8 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     if train:
       optimizer = state['optimizer']
       optimizer.zero_grad()
-      loss = loss_fn(model, batch)
+      with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=mixed_precision):
+        loss = loss_fn(model, batch)
       loss.backward()
       optimize_fn(optimizer, model.parameters(), step=state['step'])
       state['step'] += 1
@@ -202,7 +206,8 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
         ema = state['ema']
         ema.store(model.parameters())
         ema.copy_to(model.parameters())
-        loss = loss_fn(model, batch)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=mixed_precision):
+          loss = loss_fn(model, batch)
         ema.restore(model.parameters())
 
     return loss

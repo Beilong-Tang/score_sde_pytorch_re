@@ -14,10 +14,17 @@
 # limitations under the License.
 
 # pylint: skip-file
-"""Return training and evaluation/test datasets from config files."""
-import jax
-import tensorflow as tf
-import tensorflow_datasets as tfds
+"""Return training and evaluation/test data loaders from config files.
+
+This is a pure PyTorch data pipeline (no TensorFlow/TFDS dependency) and
+currently only supports the CIFAR-10 dataset.
+"""
+import torch
+import torch.distributed as dist
+import torchvision
+import torchvision.transforms.functional as TF
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 
 def get_data_scaler(config):
@@ -38,34 +45,49 @@ def get_data_inverse_scaler(config):
     return lambda x: x
 
 
-def crop_resize(image, resolution):
-  """Crop and resize an image to the given resolution."""
-  crop = tf.minimum(tf.shape(image)[0], tf.shape(image)[1])
-  h, w = tf.shape(image)[0], tf.shape(image)[1]
-  image = image[(h - crop) // 2:(h + crop) // 2,
-          (w - crop) // 2:(w + crop) // 2]
-  image = tf.image.resize(
-    image,
-    size=(resolution, resolution),
-    antialias=True,
-    method=tf.image.ResizeMethod.BICUBIC)
-  return tf.cast(image, tf.uint8)
+class _RepeatingLoader:
+  """Iterates a `DataLoader` for `num_epochs` epochs, or forever if `None`."""
+
+  def __init__(self, dataloader, num_epochs=None, sampler=None):
+    self.dataloader = dataloader
+    self.num_epochs = num_epochs
+    self.sampler = sampler
+
+  def __iter__(self):
+    epoch = 0
+    while self.num_epochs is None or epoch < self.num_epochs:
+      if isinstance(self.sampler, DistributedSampler):
+        self.sampler.set_epoch(epoch)
+      for batch in self.dataloader:
+        yield batch
+      epoch += 1
+
+  def __len__(self):
+    return len(self.dataloader)
 
 
-def resize_small(image, resolution):
-  """Shrink an image to the given resolution."""
-  h, w = image.shape[0], image.shape[1]
-  ratio = resolution / min(h, w)
-  h = tf.round(h * ratio, tf.int32)
-  w = tf.round(w * ratio, tf.int32)
-  return tf.image.resize(image, [h, w], antialias=True)
+def _make_transform(config, uniform_dequantization, evaluation):
+  """Build the per-image preprocessing function used by the data loaders."""
+  image_size = config.data.image_size
+  random_flip = config.data.random_flip and not evaluation
+
+  def transform(pil_img):
+    img = TF.to_tensor(pil_img)  # CHW, float32 in [0, 1]
+    if img.shape[-2] != image_size or img.shape[-1] != image_size:
+      img = TF.resize(img, [image_size, image_size], antialias=True)
+    if random_flip and torch.rand(()) < 0.5:
+      img = torch.flip(img, dims=[-1])
+    if uniform_dequantization:
+      img = (torch.rand_like(img) + img * 255.) / 256.
+    return img
+
+  return transform
 
 
-def central_crop(image, size):
-  """Crop the center of an image to the given size."""
-  top = (image.shape[0] - size) // 2
-  left = (image.shape[1] - size) // 2
-  return tf.image.crop_to_bounding_box(image, top, left, size, size)
+def _collate_fn(batch):
+  images = torch.stack([img for img, _ in batch], dim=0)
+  labels = torch.tensor([label for _, label in batch], dtype=torch.long)
+  return dict(image=images, label=labels)
 
 
 def get_dataset(config, uniform_dequantization=False, evaluation=False):
@@ -79,118 +101,39 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
   Returns:
     train_ds, eval_ds, dataset_builder.
   """
-  # Compute batch size for this worker.
-  batch_size = config.training.batch_size if not evaluation else config.eval.batch_size
-  if batch_size % jax.device_count() != 0:
-    raise ValueError(f'Batch sizes ({batch_size} must be divided by'
-                     f'the number of devices ({jax.device_count()})')
+  if config.data.dataset != 'CIFAR10':
+    raise NotImplementedError(
+      f'Dataset {config.data.dataset} not supported. This PyTorch-only '
+      'data pipeline currently supports CIFAR10 only.')
 
-  # Reduce this when image resolution is too large and data pointer is stored
-  shuffle_buffer_size = 10000
-  prefetch_size = tf.data.experimental.AUTOTUNE
+  batch_size = config.training.batch_size if not evaluation else config.eval.batch_size
+  num_workers = getattr(config.data, 'num_workers', 4)
+  data_root = getattr(config.data, 'root', './data')
   num_epochs = None if not evaluation else 1
 
-  # Create dataset builders for each dataset.
-  if config.data.dataset == 'CIFAR10':
-    dataset_builder = tfds.builder('cifar10')
-    train_split_name = 'train'
-    eval_split_name = 'test'
+  distributed = dist.is_available() and dist.is_initialized()
+  # Only rank 0 downloads to avoid every process racing to write the same files.
+  if not distributed or dist.get_rank() == 0:
+    torchvision.datasets.CIFAR10(root=data_root, train=True, download=False)
+    torchvision.datasets.CIFAR10(root=data_root, train=False, download=False)
+  if distributed:
+    dist.barrier()
 
-    def resize_op(img):
-      img = tf.image.convert_image_dtype(img, tf.float32)
-      return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
+  transform = _make_transform(config, uniform_dequantization, evaluation)
+  train_set = torchvision.datasets.CIFAR10(
+    root=data_root, train=True, download=False, transform=transform)
+  eval_set = torchvision.datasets.CIFAR10(
+    root=data_root, train=False, download=False, transform=transform)
 
-  elif config.data.dataset == 'SVHN':
-    dataset_builder = tfds.builder('svhn_cropped')
-    train_split_name = 'train'
-    eval_split_name = 'test'
+  def make_loader(dataset):
+    sampler = DistributedSampler(dataset, shuffle=True) if distributed else None
+    dataloader = DataLoader(
+      dataset, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
+      drop_last=True, num_workers=num_workers, pin_memory=True, collate_fn=_collate_fn,
+      persistent_workers=num_workers > 0,
+      prefetch_factor=4 if num_workers > 0 else None)
+    return _RepeatingLoader(dataloader, num_epochs=num_epochs, sampler=sampler)
 
-    def resize_op(img):
-      img = tf.image.convert_image_dtype(img, tf.float32)
-      return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
-
-  elif config.data.dataset == 'CELEBA':
-    dataset_builder = tfds.builder('celeb_a')
-    train_split_name = 'train'
-    eval_split_name = 'validation'
-
-    def resize_op(img):
-      img = tf.image.convert_image_dtype(img, tf.float32)
-      img = central_crop(img, 140)
-      img = resize_small(img, config.data.image_size)
-      return img
-
-  elif config.data.dataset == 'LSUN':
-    dataset_builder = tfds.builder(f'lsun/{config.data.category}')
-    train_split_name = 'train'
-    eval_split_name = 'validation'
-
-    if config.data.image_size == 128:
-      def resize_op(img):
-        img = tf.image.convert_image_dtype(img, tf.float32)
-        img = resize_small(img, config.data.image_size)
-        img = central_crop(img, config.data.image_size)
-        return img
-
-    else:
-      def resize_op(img):
-        img = crop_resize(img, config.data.image_size)
-        img = tf.image.convert_image_dtype(img, tf.float32)
-        return img
-
-  elif config.data.dataset in ['FFHQ', 'CelebAHQ']:
-    dataset_builder = tf.data.TFRecordDataset(config.data.tfrecords_path)
-    train_split_name = eval_split_name = 'train'
-
-  else:
-    raise NotImplementedError(
-      f'Dataset {config.data.dataset} not yet supported.')
-
-  # Customize preprocess functions for each dataset.
-  if config.data.dataset in ['FFHQ', 'CelebAHQ']:
-    def preprocess_fn(d):
-      sample = tf.io.parse_single_example(d, features={
-        'shape': tf.io.FixedLenFeature([3], tf.int64),
-        'data': tf.io.FixedLenFeature([], tf.string)})
-      data = tf.io.decode_raw(sample['data'], tf.uint8)
-      data = tf.reshape(data, sample['shape'])
-      data = tf.transpose(data, (1, 2, 0))
-      img = tf.image.convert_image_dtype(data, tf.float32)
-      if config.data.random_flip and not evaluation:
-        img = tf.image.random_flip_left_right(img)
-      if uniform_dequantization:
-        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
-      return dict(image=img, label=None)
-
-  else:
-    def preprocess_fn(d):
-      """Basic preprocessing function scales data to [0, 1) and randomly flips."""
-      img = resize_op(d['image'])
-      if config.data.random_flip and not evaluation:
-        img = tf.image.random_flip_left_right(img)
-      if uniform_dequantization:
-        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
-
-      return dict(image=img, label=d.get('label', None))
-
-  def create_dataset(dataset_builder, split):
-    dataset_options = tf.data.Options()
-    dataset_options.experimental_optimization.map_parallelization = True
-    dataset_options.experimental_threading.private_threadpool_size = 48
-    dataset_options.experimental_threading.max_intra_op_parallelism = 1
-    read_config = tfds.ReadConfig(options=dataset_options)
-    if isinstance(dataset_builder, tfds.core.DatasetBuilder):
-      dataset_builder.download_and_prepare()
-      ds = dataset_builder.as_dataset(
-        split=split, shuffle_files=True, read_config=read_config)
-    else:
-      ds = dataset_builder.with_options(dataset_options)
-    ds = ds.repeat(count=num_epochs)
-    ds = ds.shuffle(shuffle_buffer_size)
-    ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    ds = ds.batch(batch_size, drop_remainder=True)
-    return ds.prefetch(prefetch_size)
-
-  train_ds = create_dataset(dataset_builder, train_split_name)
-  eval_ds = create_dataset(dataset_builder, eval_split_name)
-  return train_ds, eval_ds, dataset_builder
+  train_ds = make_loader(train_set)
+  eval_ds = make_loader(eval_set)
+  return train_ds, eval_ds, None

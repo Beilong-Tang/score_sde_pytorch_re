@@ -90,7 +90,13 @@ def create_model(config):
   model_name = config.model.name
   score_model = get_model(model_name)(config)
   score_model = score_model.to(config.device)
-  score_model = torch.nn.DataParallel(score_model)
+  if getattr(config.training, 'compile', False):
+    score_model = torch.compile(score_model)
+  if torch.distributed.is_available() and torch.distributed.is_initialized():
+    score_model = torch.nn.parallel.DistributedDataParallel(
+      score_model, device_ids=[config.device.index], output_device=config.device.index)
+  else:
+    score_model = torch.nn.DataParallel(score_model)
   return score_model
 
 
